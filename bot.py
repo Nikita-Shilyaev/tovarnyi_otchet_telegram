@@ -1,24 +1,33 @@
 """Telegram-бот товарного отчета (long polling).
 
 Команды:
-    /updated - название листа report.xlsx на Google Drive (там записана максимальная дата_факта)
-    /report  - отправляет в чат файл report.xlsx с Google Drive
+    /updated   - название листа report.xlsx на Google Drive (там записана максимальная дата_факта)
+    /report    - отправляет в чат report.xlsx: по файлу на каждый доступный филиал ({филиал}_{as_of}.xlsx),
+                 а при доступе all - общий отчет по всем филиалам
+    /my_filial - список доступных филиалов
+
+Доступ берется из Google Таблицы Users (колонки user_id, access): user_id - числовой id в Telegram,
+access - название филиала (значение в поле "магазин" отчета) или all.
 
 Запуск:
     python bot.py            # слушать команды
     python bot.py --updated  # вывести дату обновления и выйти (без Telegram)
 """
 import argparse
+import csv
+import io
 import logging
 import os
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
-from drive_client import download_bytes, get_drive_service
+from drive_client import download_bytes, export_sheet_csv, get_drive_service
 
 BASE_DIR = Path(__file__).parent
 
@@ -28,10 +37,15 @@ CREDS_PATH = BASE_DIR / os.environ["DRIVE_CREDS_PATH"]
 TOKEN_PATH = BASE_DIR / os.environ["DRIVE_TOKEN_PATH"]
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 REPORT_XLSX_ID = os.environ["REPORT_XLSX_ID"]
+USERS_SHEET_ID = os.environ["USERS_SHEET_ID"]
 XLSX_MIMETYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 POLL_TIMEOUT = 50  # сек, long polling
+
+ACCESS_ALL = "all"
+SHOP_COLUMN = "магазин"
+REPORT_TABLE = "report"  # имя таблицы Excel в report.xlsx (см. app.format_sheet)
 
 logger = logging.getLogger("bot")
 
@@ -58,16 +72,76 @@ def send_document(chat_id: int, filename: str, data: bytes) -> None:
     response.raise_for_status()
 
 
-def handle_updated(chat_id: int) -> None:
+def get_access(user_id: int) -> list[str]:
+    """Филиалы пользователя из таблицы Users (в порядке строк); ['all'] - все филиалы; [] - нет доступа."""
+    service = get_drive_service(CREDS_PATH, TOKEN_PATH)
+    rows = csv.DictReader(io.StringIO(export_sheet_csv(service, USERS_SHEET_ID)))
+    access = defaultdict(list)
+    for row in rows:
+        access[row["user_id"].strip()].append(row["access"].strip())
+    filials = access.get(str(user_id), [])
+    if any(f.lower() == ACCESS_ALL for f in filials):
+        return [ACCESS_ALL]
+    return filials
+
+
+def filter_report(report_bytes: bytes, filial: str) -> bytes | None:
+    """Копия report.xlsx только со строками филиала (формат сохраняется); None, если строк нет."""
+    workbook = load_workbook(io.BytesIO(report_bytes))
+    sheet = workbook.active
+    shop_col = [cell.value for cell in sheet[1]].index(SHOP_COLUMN)
+    other_rows = [row[0].row for row in sheet.iter_rows(min_row=2) if row[shop_col].value != filial]
+    if len(other_rows) == sheet.max_row - 1:
+        return None
+    for row in reversed(other_rows):
+        sheet.delete_rows(row)
+    table = sheet.tables[REPORT_TABLE]
+    table.ref = table.autoFilter.ref = f"A1:{get_column_letter(sheet.max_column)}{sheet.max_row}"
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def handle_updated(chat_id: int, user_id: int) -> None:
     send_message(chat_id, f"Данные обновлены по {get_updated_date()}")
 
 
-def handle_report(chat_id: int) -> None:
+def handle_my_filial(chat_id: int, user_id: int) -> None:
+    filials = get_access(user_id)
+    if not filials:
+        send_message(chat_id, f"Нет доступа. Ваш user_id: {user_id}")
+    elif filials == [ACCESS_ALL]:
+        send_message(chat_id, "Доступен отчет по всем филиалам")
+    else:
+        send_message(chat_id, ", ".join(filials))
+
+
+def handle_report(chat_id: int, user_id: int) -> None:
+    filials = get_access(user_id)
+    if not filials:
+        send_message(chat_id, f"Нет доступа. Ваш user_id: {user_id}")
+        return
+
     service = get_drive_service(CREDS_PATH, TOKEN_PATH)
-    send_document(chat_id, "report.xlsx", download_bytes(service, REPORT_XLSX_ID).getvalue())
+    report = download_bytes(service, REPORT_XLSX_ID).getvalue()
+    as_of = load_workbook(io.BytesIO(report), read_only=True).sheetnames[0]  # дата обновления - название листа
+
+    if filials == [ACCESS_ALL]:
+        send_document(chat_id, f"Все филиалы_{as_of}.xlsx", report)
+        return
+
+    no_data = []
+    for filial in filials:
+        filial_report = filter_report(report, filial)
+        if filial_report is None:
+            no_data.append(filial)
+        else:
+            send_document(chat_id, f"{filial}_{as_of}.xlsx", filial_report)
+    if no_data:
+        send_message(chat_id, f"Нет данных в отчете по филиалам: {', '.join(no_data)}")
 
 
-HANDLERS = {"/updated": handle_updated, "/report": handle_report}
+HANDLERS = {"/updated": handle_updated, "/report": handle_report, "/my_filial": handle_my_filial}
 
 
 def handle_update(update: dict) -> None:
@@ -78,7 +152,7 @@ def handle_update(update: dict) -> None:
     command = text.split()[0].split("@")[0].lower()  # "/updated@bot_name" -> "/updated"
     handler = HANDLERS.get(command)
     if handler:
-        handler(message["chat"]["id"])
+        handler(message["chat"]["id"], message["from"]["id"])
 
 
 def run() -> None:

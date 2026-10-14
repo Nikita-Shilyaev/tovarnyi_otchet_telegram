@@ -137,6 +137,11 @@ def download_bytes(service, file_id):
     return buffer
 
 
+def export_sheet_csv(service, file_id):
+    """Экспортирует нативную Google Таблицу (первый лист) в CSV, возвращает текст."""
+    return service.files().export_media(fileId=file_id, mimeType="text/csv").execute().decode("utf-8")
+
+
 def update_file_bytes(service, file_id, data, mimetype):
     """Перезаписывает содержимое существующего файла Drive (по id) байтами data."""
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mimetype, resumable=True)
