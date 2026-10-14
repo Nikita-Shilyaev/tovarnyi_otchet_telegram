@@ -1,0 +1,5 @@
+.env
+creds/
+CLAUDE.md
+other/
+__pycache__/

@@ -1,0 +1,15 @@
+x-common: &common
+  build: .
+  env_file: .env
+  volumes:
+    - ./creds:/app/creds  # token.json обновляется на ходу, поэтому не read-only
+  restart: unless-stopped
+
+services:
+  app:
+    <<: *common
+    command: python app.py --schedule
+
+  bot:
+    <<: *common
+    command: python bot.py
