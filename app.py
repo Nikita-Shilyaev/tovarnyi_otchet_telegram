@@ -143,6 +143,15 @@ def format_sheet(ws, columns: list) -> None:
         ws.column_dimensions[letter].width = header_width(name, max(width, 6) + 3)
 
 
+def build_report_xlsx(df: pd.DataFrame, sheet_name: str) -> bytes:
+    """xlsx в памяти: один лист с отформатированной таблицей (общий для витрины и бота)."""
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+        format_sheet(writer.sheets[sheet_name], list(df.columns))
+    return buffer.getvalue()
+
+
 def update_report(as_of_arg: str = None) -> None:
     service = get_drive_service(CREDS_PATH, TOKEN_PATH)
     plan = read_drive_csv(service, PLAN_ID, dtype={"месяц": str}).rename(columns={"бит литера": "бит_литера"})
@@ -186,22 +195,19 @@ def update_report(as_of_arg: str = None) -> None:
     out["шт продать осталось"] = np.ceil(out["плана осталось"] / price_col.where(price_col > 0))  # вверх до целых
     need, stock = out["шт продать осталось"], out["остаток_шт"]
     enough = stock >= need * STOCK_COVER_OK  # остаток / шт продать >= 3 (при need=0 тоже верно)
+    no_stock = (stock == 0) & (out["плана осталось"] > 0)  # цены нет (остаток 0), но план не выполнен
     out["возможность выполнить план"] = np.select(
-        [need.isna(), stock < need, ~enough],
-        [None, "нет, остатков не хватает", "да, рекомендуется пополнить запасы"],
+        [no_stock, need.isna(), stock < need, ~enough],
+        ["нет, остатков не хватает", None, "нет, остатков не хватает", "да, рекомендуется пополнить запасы"],
         default="да, достаточный запас",
     )
-    out.loc[need.isna(), "возможность выполнить план"] = np.nan
+    out.loc[need.isna() & ~no_stock, "возможность выполнить план"] = np.nan
 
     # колонки плана остаются как в csv, справа добавляются расчетные
     out = out.rename(columns={"бит_литера": "бит литера"})
     out = out[[*PLAN_COLUMNS, "факт_mtd", "выполнение плана", "плана осталось", "остаток_шт", "средняя цена продажи с учетом скидки", "шт продать осталось", "возможность выполнить план", "дата_факта", "дата_остатка"]]
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        sheet_name = f"{out['дата_факта'].max():%d.%m.%Y}"  # бот (/updated) берет дату обновления из названия листа
-        out.to_excel(writer, sheet_name=sheet_name, index=False)
-        format_sheet(writer.sheets[sheet_name], list(out.columns))
-    update_file_bytes(service, REPORT_XLSX_ID, buffer.getvalue(), XLSX_MIMETYPE)
+    sheet_name = f"{out['дата_факта'].max():%d.%m.%Y}"  # бот (/updated) берет дату обновления из названия листа
+    update_file_bytes(service, REPORT_XLSX_ID, build_report_xlsx(out, sheet_name), XLSX_MIMETYPE)
 
     in_period = sales[(sales["date"] >= pd.Timestamp("2026-01-01")) & (sales["date"] <= as_of)]
     print(f"report.xlsx (Drive): {len(out)} строк, месяцев {out['месяц'].nunique()}, факт по {as_of.date()}")

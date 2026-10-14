@@ -22,11 +22,12 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+import pandas as pd
 import requests
 from dotenv import load_dotenv
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
 
+from app import build_report_xlsx
 from drive_client import download_bytes, export_sheet_csv, get_drive_service
 
 BASE_DIR = Path(__file__).parent
@@ -44,8 +45,7 @@ API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 POLL_TIMEOUT = 50  # сек, long polling
 
 ACCESS_ALL = "all"
-SHOP_COLUMN = "магазин"
-REPORT_TABLE = "report"  # имя таблицы Excel в report.xlsx (см. app.format_sheet)
+SHOP_COLUMN_IDX = 1  # "магазин" - второй столбец report.xlsx
 
 logger = logging.getLogger("bot")
 
@@ -85,21 +85,12 @@ def get_access(user_id: int) -> list[str]:
     return filials
 
 
-def filter_report(report_bytes: bytes, filial: str) -> bytes | None:
-    """Копия report.xlsx только со строками филиала (формат сохраняется); None, если строк нет."""
-    workbook = load_workbook(io.BytesIO(report_bytes))
-    sheet = workbook.active
-    shop_col = [cell.value for cell in sheet[1]].index(SHOP_COLUMN)
-    other_rows = [row[0].row for row in sheet.iter_rows(min_row=2) if row[shop_col].value != filial]
-    if len(other_rows) == sheet.max_row - 1:
+def filter_report(report: pd.DataFrame, filial: str, as_of: str) -> bytes | None:
+    """xlsx (в памяти) только со строками филиала в том же формате, что и report.xlsx; None, если строк нет."""
+    filial_rows = report[report.iloc[:, SHOP_COLUMN_IDX] == filial]
+    if filial_rows.empty:
         return None
-    for row in reversed(other_rows):
-        sheet.delete_rows(row)
-    table = sheet.tables[REPORT_TABLE]
-    table.ref = table.autoFilter.ref = f"A1:{get_column_letter(sheet.max_column)}{sheet.max_row}"
-    buffer = io.BytesIO()
-    workbook.save(buffer)
-    return buffer.getvalue()
+    return build_report_xlsx(filial_rows, as_of)
 
 
 def handle_updated(chat_id: int, user_id: int) -> None:
@@ -131,8 +122,11 @@ def handle_report(chat_id: int, user_id: int) -> None:
         return
 
     no_data = []
+    report_df = pd.read_excel(io.BytesIO(report))  # читаем один раз, дальше только фильтр по филиалу
+    for col in report_df.select_dtypes("datetime"):
+        report_df[col] = report_df[col].dt.date  # как в app.py: даты без времени
     for filial in filials:
-        filial_report = filter_report(report, filial)
+        filial_report = filter_report(report_df, filial, as_of)
         if filial_report is None:
             no_data.append(filial)
         else:
