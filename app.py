@@ -22,7 +22,8 @@ import numpy as np
 import pandas as pd
 from apscheduler.schedulers.blocking import BlockingScheduler
 from dotenv import load_dotenv
-from openpyxl.styles import Alignment
+from openpyxl.formatting.rule import CellIsRule
+from openpyxl.styles import Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
@@ -54,6 +55,13 @@ COLUMN_FORMATS = {
     "факт_mtd": (FINANCIAL, ("financial", 0)),
     "плана осталось": (FINANCIAL, ("financial", 0)),
     "средняя цена продажи с учетом скидки": (FINANCIAL, ("financial", 0)),
+}
+# заливка флага "возможность выполнить план" (стандартные цвета палитры Excel)
+FLAG_COLUMN = "возможность выполнить план"
+FLAG_COLORS = {
+    "да, достаточный запас": "92D050",  # светло-зеленый
+    "да, рекомендуется пополнить запасы": "FFFF00",  # желтый
+    "нет, остатков не хватает": "FF0000",  # красный
 }
 HEADER_LINES = 3  # высота строки заголовков = столько обычных строк
 ROW_HEIGHT = 15  # высота обычной строки в Excel, pt
@@ -141,6 +149,12 @@ def format_sheet(ws, columns: list) -> None:
             width = max(width, display_length(cell.value, display))
         # запас под фильтр в заголовке; заголовок должен влезать в HEADER_LINES строк
         ws.column_dimensions[letter].width = header_width(name, max(width, 6) + 3)
+        if name == FLAG_COLUMN and last_row > 1:
+            for text, color in FLAG_COLORS.items():
+                fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+                ws.conditional_formatting.add(
+                    f"{letter}2:{letter}{last_row}", CellIsRule(operator="equal", formula=[f'"{text}"'], fill=fill)
+                )
 
 
 def build_report_xlsx(df: pd.DataFrame, sheet_name: str) -> bytes:
