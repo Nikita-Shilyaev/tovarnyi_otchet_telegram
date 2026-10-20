@@ -4,7 +4,7 @@
     /updated   - название листа report.xlsx на Google Drive (там записана максимальная дата_факта)
     /report    - отправляет в чат report.xlsx: по файлу на каждый доступный филиал ({филиал}_{as_of}.xlsx),
                  а при доступе all - общий отчет по всем филиалам
-    /my_filial - список доступных филиалов
+    /my_store - список доступных филиалов
 
 Доступ берется из Google Таблицы Users (колонки user_id, access): user_id - числовой id в Telegram,
 access - название филиала (значение в поле "магазин" отчета) или all.
@@ -97,7 +97,7 @@ def handle_updated(chat_id: int, user_id: int) -> None:
     send_message(chat_id, f"Данные обновлены по {get_updated_date()}")
 
 
-def handle_my_filial(chat_id: int, user_id: int) -> None:
+def handle_my_store(chat_id: int, user_id: int) -> None:
     filials = get_access(user_id)
     if not filials:
         send_message(chat_id, f"Нет доступа. Ваш user_id: {user_id}")
@@ -135,7 +135,7 @@ def handle_report(chat_id: int, user_id: int) -> None:
         send_message(chat_id, f"Нет данных в отчете по филиалам: {', '.join(no_data)}")
 
 
-HANDLERS = {"/updated": handle_updated, "/report": handle_report, "/my_filial": handle_my_filial}
+HANDLERS = {"/updated": handle_updated, "/report": handle_report, "/my_store": handle_my_store}
 
 
 def handle_update(update: dict) -> None:
