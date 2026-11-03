@@ -6,7 +6,8 @@ REPORTS_FOLDER_ID: report.xlsx (все филиалы) и по файлу на �
 записывает эту дату в pipeline_state.csv (source=tovarnyi_otchet_tgbot) - по ней бот находит папку.
 Листы report.xlsx: "План факт по филиалам" (первый): план на год и месяц
 (дневной план), факт YTD/MTD (все продажи филиала), выполнение плана и факт прошлого года за те же даты;
-"План факт по категориям" - витрина; "Обозначения" - расшифровка YTD/MTD/LY/YoY. В файлах филиалов те же листы, на листе по филиалам - только свой столбец.
+"План факт по категориям" - витрина; "Артикулы" - остаток и базовая скорость продаж по магазину и артикулу
+(все артикулы и магазины, одинаковый во всех файлах); "Обозначения" - расшифровка YTD/MTD/LY/YoY. В файлах филиалов те же листы, на листе по филиалам - только свой столбец.
 Месяцы: все месяцы плана с января 2026 по месяц последней даты продаж.
 - факт: сумма_со_скидкой за месяц (для текущего месяца - MTD по as_of);
 - остаток: срез на 1-е число месяца; если среза на 1-е нет (текущий месяц) - последний срез внутри месяца.
@@ -72,6 +73,7 @@ COLUMN_FORMATS = {
     "факт_mtd": (FINANCIAL, ("financial", 0)),
     "плана осталось выполнить": (FINANCIAL, ("financial", 0)),
     "средняя цена продажи с учетом скидки": (FINANCIAL, ("financial", 0)),
+    "скорость продаж базовая": ("0.00", ("fixed", 2)),
 }
 # заливка флага "возможность выполнить план" (стандартные цвета палитры Excel)
 FLAG_COLUMN = "возможность выполнить план"
@@ -134,6 +136,8 @@ def display_length(value, display=None) -> int:
     kind, digits = display or (None, 0)
     if kind == "percent":
         return len(f"{value * 100:.{digits}f}%")
+    if kind == "fixed":
+        return len(f"{value:.{digits}f}")
     if kind == "financial":
         return len(f"{value:,.{digits}f}") + 4  # " ₸" и отступы формата _- и -_
     if isinstance(value, float):
@@ -149,10 +153,10 @@ def header_width(header: str, min_width: int) -> int:
     return width
 
 
-def format_sheet(ws, columns: list) -> None:
+def format_sheet(ws, columns: list, table_name: str = "report") -> None:
     """Таблица Excel: стиль таблицы, заголовки, форматы чисел, ширина столбцов по значениям."""
     last_col, last_row = get_column_letter(ws.max_column), ws.max_row
-    table = Table(displayName="report", ref=f"A1:{last_col}{last_row}")
+    table = Table(displayName=table_name, ref=f"A1:{last_col}{last_row}")
     table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
     ws.add_table(table)
     ws.row_dimensions[1].height = ROW_HEIGHT * HEADER_LINES
@@ -191,6 +195,8 @@ GLOSSARY = pd.DataFrame(
         ("MTD", "период с первого числа текущего месяца по дату отчета"),
         ("LY", "показатель за такой же период в прошлом году"),
         ("YoY", "сравнение показателей за текущий год к прошлому году за одинаковый период"),
+        ("скорость продаж базовая", "среднее кол-во продаж артикула в шт в месяц за последние 12 месяцев до даты отчета "
+                                    "(продажи шт за 12 мес / 12), без учета дней отсутствия товара на остатках"),
     ],
     columns=["обозначение", "описание"],
 )
@@ -314,9 +320,104 @@ def solid_data_bars(xlsx: bytes) -> bytes:
     return out.getvalue()
 
 
-def build_report_xlsx(df: pd.DataFrame, plan_fact: pd.DataFrame = None) -> bytes:
-    """xlsx в памяти: лист план-факт по филиалам (если передан, первым), лист витрины по категориям
-    и (вместе с план-фактом) лист "Обозначения"."""
+ARTICLES_SHEET = "Артикулы"
+# строка листа: магазин + изделие; разные бит литера / поставщик / категория / подкатегория = разные изделия
+ITEM_KEY = ["артикул", "бит литера", "поставщик", "категория", "подкатегория"]
+# прочие признаки - самое частое значение по изделию
+ITEM_ATTRS = ["коллекция", "вставка", "материал"]
+ARTICLES_COLUMNS = ["магазин", "артикул", "поставщик", "бит литера", "категория", "подкатегория", "коллекция", "вставка",
+                    "материал", "доступные цвета", "доступные размеры", "продажи шт за 12 мес", "скорость продаж базовая",
+                    "текущий остаток"]
+SPEED_MONTHS = 12
+# цвет в остатках пишется по-разному ("Белое", "БЕЛЫЙ", "<>", "жолтое") - приводим к словарю продаж
+COLOR_STEMS = [("бел", "Белый"), ("жел", "Желтый"), ("жол", "Желтый"), ("крас", "Красный"), ("роз", "Розовый"),
+               ("комб", "Комбинированный"), ("серебр", "Серебро"), ("золот", "Золото")]
+
+
+def normalize_color(value) -> str:
+    """Цвет к единому словарю; пусто, мусор ("<>", "---", "не указан", размеры) и "нет данных" - пустая строка."""
+    text = str(value).strip().lower() if pd.notna(value) else ""
+    return next((color for stem, color in COLOR_STEMS if text.startswith(stem)), "")
+
+
+def barcode_attrs(sales: pd.DataFrame, ostatki: pd.DataFrame) -> pd.DataFrame:
+    """Признаки изделия по штрихкоду: последняя продажа, для непроданных - последняя запись в остатках (по всем срезам).
+
+    Один источник признаков для продаж и остатков, чтобы продажи и остаток одного изделия попали в одну строку
+    (в старых срезах остатков признаки проданных штрихкодов бывают устаревшими, например поставщик).
+    Подкатегории в остатках нет - берется самая частая по артикулу в продажах.
+    """
+    cols = ["штрихкод", "артикул", "бит_литера", "поставщик", "категория", "коллекция", "вставка", "материал", "цвет", "размер"]
+    from_stock = ostatki.rename(columns={"камень": "вставка"}).sort_values("date").drop_duplicates("штрихкод", keep="last")[cols]
+    from_sales = sales.sort_values("date").drop_duplicates("штрихкод", keep="last")[cols]
+    # артикул в остатках и продажах записан по-разному ("544020301429" / "544020301429P", "TR679" / "R-TR679"):
+    # по общим штрихкодам переводим артикулы остатков в формат продаж (самое частое соответствие)
+    pairs = from_stock[["штрихкод", "артикул"]].merge(from_sales[["штрихкод", "артикул"]], on="штрихкод", suffixes=("", "_sales"))
+    pairs = pairs[pairs["артикул"] != pairs["артикул_sales"]]
+    art_map = pairs.groupby("артикул")["артикул_sales"].agg(lambda col: col.mode().iat[0])
+    from_stock["артикул"] = from_stock["артикул"].map(art_map).fillna(from_stock["артикул"])
+    from_stock = from_stock[~from_stock["штрихкод"].isin(from_sales["штрихкод"])]
+    attrs = pd.concat([from_sales, from_stock], ignore_index=True).rename(columns={"бит_литера": "бит литера"})
+    attrs["цвет"] = attrs["цвет"].map(normalize_color)
+    attrs["размер"] = pd.to_numeric(attrs["размер"], errors="coerce")
+    subcategory = sales.dropna(subset=["подкатегория"]).groupby("артикул")["подкатегория"].agg(lambda col: col.mode().iat[0])
+    attrs["подкатегория"] = attrs["артикул"].map(subcategory)
+    attrs[ITEM_KEY[1:]] = attrs[ITEM_KEY[1:]].fillna("")  # пустые признаки - пустая строка (NaN в ключах группировки теряется)
+    return attrs.set_index("штрихкод")
+
+
+def join_values(values: pd.Series, numeric: bool = False) -> str:
+    """Уникальные непустые значения через запятую ("17, 17.5, 18"); размеры - по возрастанию и без ".0"."""
+    values = values.dropna()
+    values = values[values != ""].unique()
+    if numeric:
+        return ", ".join(f"{v:g}" for v in sorted(values))
+    return ", ".join(sorted(values))
+
+
+def calc_articles(sales: pd.DataFrame, ostatki: pd.DataFrame, snapshot: pd.Timestamp, as_of: pd.Timestamp) -> pd.DataFrame:
+    """Лист "Артикулы": магазин - изделие (артикул, бит литера, поставщик, категория, подкатегория),
+    базовая скорость продаж, текущий остаток и доступные (в текущем остатке) цвета и размеры списком.
+
+    скорость продаж базовая = продажи шт (количество, нетто с возвратами) за 12 месяцев до даты отчета
+    (as_of - 1 год ... as_of - 1 день) / 12; дни без остатка намеренно не учитываются (первая версия).
+    текущий остаток - срез остатков на дату отчета (тот же, что "дата_остатка" текущего месяца в витрине).
+    Строки: магазин - изделие с остатком > 0 или с продажами за период; все бит литеры и магазины.
+    """
+    attrs = barcode_attrs(sales, ostatki)
+    attrs = attrs[~attrs.index.duplicated(keep="first")]  # платки и монеты могут делить штрихкод
+    period = sales[(sales["date"] >= as_of - pd.DateOffset(years=1)) & (sales["date"] < as_of)]
+    stock_rows = ostatki[ostatki["date"] == snapshot]
+    keyed = lambda df: df[["магазин", "штрихкод"]].join(attrs[ITEM_KEY + ITEM_ATTRS + ["цвет", "размер"]], on="штрихкод")
+    sold_rows = keyed(period).assign(qty=period["количество"].values)
+    stock_rows = keyed(stock_rows).assign(qty=stock_rows["остаток"].values)
+    group = ["магазин", *ITEM_KEY]
+    t = pd.concat(
+        [sold_rows.groupby(group)["qty"].sum().rename("продажи шт за 12 мес"),
+         stock_rows.groupby(group)["qty"].sum().rename("текущий остаток")],
+        axis=1,
+    ).fillna(0)
+    t = t[(t["текущий остаток"] > 0) | (t["продажи шт за 12 мес"] != 0)].reset_index()
+    t["скорость продаж базовая"] = t["продажи шт за 12 мес"] / SPEED_MONTHS
+    mode = lambda col: col.mode().iat[0] if col.notna().any() else None
+    item_attrs = pd.concat([stock_rows, sold_rows]).groupby(ITEM_KEY)[ITEM_ATTRS].agg(mode)
+    t = t.merge(item_attrs, left_on=ITEM_KEY, right_index=True, how="left")
+    in_stock = stock_rows[stock_rows["qty"] > 0].groupby(group)
+    available = pd.DataFrame({
+        "доступные цвета": in_stock["цвет"].agg(join_values),
+        "доступные размеры": in_stock["размер"].agg(lambda col: join_values(col, numeric=True)),
+    })
+    t = t.merge(available, left_on=group, right_index=True, how="left")
+    t[["доступные цвета", "доступные размеры"]] = t[["доступные цвета", "доступные размеры"]].fillna("")
+    for col in ["продажи шт за 12 мес", "текущий остаток"]:
+        if (t[col] % 1 == 0).all():  # штуки целые - пишем без ".0"
+            t[col] = t[col].astype(int)
+    return t.sort_values(["магазин", "скорость продаж базовая"], ascending=[True, False])[ARTICLES_COLUMNS]
+
+
+def build_report_xlsx(df: pd.DataFrame, plan_fact: pd.DataFrame = None, articles: pd.DataFrame = None) -> bytes:
+    """xlsx в памяти: лист план-факт по филиалам (если передан, первым), лист витрины по категориям,
+    лист "Артикулы" (если передан) и (вместе с план-фактом) лист "Обозначения"."""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         if plan_fact is not None:
@@ -324,6 +425,9 @@ def build_report_xlsx(df: pd.DataFrame, plan_fact: pd.DataFrame = None) -> bytes
             format_plan_fact_sheet(writer.sheets[PLAN_FACT_SHEET], list(plan_fact.columns))
         df.to_excel(writer, sheet_name=REPORT_SHEET, index=False)
         format_sheet(writer.sheets[REPORT_SHEET], list(df.columns))
+        if articles is not None:
+            articles.to_excel(writer, sheet_name=ARTICLES_SHEET, index=False)
+            format_sheet(writer.sheets[ARTICLES_SHEET], list(articles.columns), table_name="articles")
         if plan_fact is not None:
             GLOSSARY.to_excel(writer, sheet_name=GLOSSARY_SHEET, index=False)
             ws = writer.sheets[GLOSSARY_SHEET]
@@ -366,10 +470,15 @@ def update_report(as_of_arg: str = None) -> None:
     service = get_drive_service(CREDS_PATH, TOKEN_PATH)
     plan = read_drive_csv(service, PLAN_ID, dtype={"месяц": str}).rename(columns={"бит литера": "бит_литера"})
 
-    sales = read_drive_csv(service, SALES_SKU_ID, usecols=["date", *KEY, "сумма_со_скидкой"], parse_dates=["date"])
+    sales = read_drive_csv(service, SALES_SKU_ID, usecols=["date", *KEY, "штрихкод", "артикул", "поставщик", "подкатегория",
+                                                            "коллекция", "вставка", "материал", "цвет", "размер",
+                                                            "количество", "сумма_со_скидкой"],
+                           parse_dates=["date"], dtype={"артикул": str, "штрихкод": str})
     as_of = pd.Timestamp(as_of_arg) if as_of_arg else sales["date"].max()
 
-    ostatki = read_drive_csv(service, OSTATKI_ID, usecols=["date", *KEY, "розничная_цена", "остаток"], parse_dates=["date"])
+    ostatki = read_drive_csv(service, OSTATKI_ID, usecols=["date", *KEY, "штрихкод", "артикул", "поставщик", "коллекция",
+                                                             "камень", "материал", "цвет", "размер", "розничная_цена", "остаток"],
+                             parse_dates=["date"], dtype={"артикул": str, "штрихкод": str})
     snapshots = sorted(ostatki["date"].unique())
 
     parts = []
@@ -422,10 +531,11 @@ def update_report(as_of_arg: str = None) -> None:
     # филиалы - столбцы в порядке витрины (только филиалы с планом по категориям)
     daily_plan = read_drive_csv(service, DAILY_PLAN_ID, usecols=["date", "магазин", "план"], parse_dates=["date"])
     plan_fact = calc_plan_fact(sales, daily_plan, list(out["магазин"].unique()), as_of)
-    upload_bytes(service, folder_id, REPORT_FILENAME, build_report_xlsx(out, plan_fact), XLSX_MIMETYPE)
+    articles = calc_articles(sales, ostatki, pick_snapshot(snapshots, as_of.replace(day=1)), as_of)
+    upload_bytes(service, folder_id, REPORT_FILENAME, build_report_xlsx(out, plan_fact, articles), XLSX_MIMETYPE)
     for filial, filial_rows in out.groupby("магазин", sort=True):
         filial_plan_fact = plan_fact[[PLAN_FACT_LABEL, filial]]  # на листе по филиалам только столбец этого филиала
-        upload_bytes(service, folder_id, filial_filename(filial), build_report_xlsx(filial_rows, filial_plan_fact), XLSX_MIMETYPE)
+        upload_bytes(service, folder_id, filial_filename(filial), build_report_xlsx(filial_rows, filial_plan_fact, articles), XLSX_MIMETYPE)
 
     # дата в pipeline_state - только после загрузки всех файлов, чтобы бот не увидел неполную папку;
     # пересчет за прошлую дату (--as-of) не откатывает дату, которую видит бот
