@@ -1,9 +1,12 @@
 """Витрина отчета: план / факт / остаток / средняя цена по месяц - магазин - бит литера - категория.
 
-Читает план (csv), Sales_sku_target и Ostatki_target с Google Drive.
+Читает план (csv), дневной план, Sales_sku_target и Ostatki_target с Google Drive.
 Результат кладет на Drive в папку с датой обновления данных (ДД.ММ.ГГГГ - последняя дата продаж) внутри
 REPORTS_FOLDER_ID: report.xlsx (все филиалы) и по файлу на филиал ({магазин}.xlsx). После загрузки всех файлов
 записывает эту дату в pipeline_state.csv (source=tovarnyi_otchet_tgbot) - по ней бот находит папку.
+Листы report.xlsx: "План факт по филиалам" (первый): план на год и месяц
+(дневной план), факт YTD/MTD (все продажи филиала), выполнение плана и факт прошлого года за те же даты;
+"План факт по категориям" - витрина; "Обозначения" - расшифровка YTD/MTD/LY/YoY. В файлах филиалов те же листы, на листе по филиалам - только свой столбец.
 Месяцы: все месяцы плана с января 2026 по месяц последней даты продаж.
 - факт: сумма_со_скидкой за месяц (для текущего месяца - MTD по as_of);
 - остаток: срез на 1-е число месяца; если среза на 1-е нет (текущий месяц) - последний срез внутри месяца.
@@ -17,7 +20,10 @@ import argparse
 import io
 import logging
 import os
+import re
 import textwrap
+import uuid
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -25,8 +31,8 @@ import numpy as np
 import pandas as pd
 from apscheduler.schedulers.blocking import BlockingScheduler
 from dotenv import load_dotenv
-from openpyxl.formatting.rule import CellIsRule
-from openpyxl.styles import Alignment, PatternFill
+from openpyxl.formatting.rule import CellIsRule, DataBarRule, FormulaRule
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
@@ -43,13 +49,14 @@ SALES_SKU_ID = os.environ["SALES_SKU_TARGET_ID"]
 OSTATKI_ID = os.environ["OSTATKI_TARGET_ID"]
 
 PLAN_ID = os.environ["PLAN_PRODAZH_ID"]
+DAILY_PLAN_ID = os.environ["DAILY_PLAN_ID"]  # daily_plan_updated_06082026.csv: date, магазин, план, месячный_план
 REPORTS_FOLDER_ID = os.environ["REPORTS_FOLDER_ID"]  # папка, в которой создаются папки с датами отчета
 PIPELINE_STATE_ID = os.environ["PIPELINE_STATE_ID"]
 XLSX_MIMETYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 CSV_MIMETYPE = "text/csv"
 
 REPORT_FILENAME = "report.xlsx"
-DATE_FORMAT = "%d.%m.%Y"  # имя папки отчета и название листа
+DATE_FORMAT = "%d.%m.%Y"  # имя папки отчета
 # строка отчета в pipeline_state.csv (source, layer, updated_at); updated_at в ISO, как у остальных строк
 STATE_SOURCE = "tovarnyi_otchet_tgbot"
 STATE_LAYER = "mart"
@@ -61,10 +68,9 @@ COLUMN_FORMATS = {
     "доля бит литеры": ("0%", ("percent", 0)),
     "доля категории внутри бит литеры": ("0%", ("percent", 0)),
     "выполнение плана": ("0.00%", ("percent", 2)),
-    "план месяц": (FINANCIAL, ("financial", 0)),
-    "план": (FINANCIAL, ("financial", 0)),
+    "план категории": (FINANCIAL, ("financial", 0)),
     "факт_mtd": (FINANCIAL, ("financial", 0)),
-    "плана осталось": (FINANCIAL, ("financial", 0)),
+    "плана осталось выполнить": (FINANCIAL, ("financial", 0)),
     "средняя цена продажи с учетом скидки": (FINANCIAL, ("financial", 0)),
 }
 # заливка флага "возможность выполнить план" (стандартные цвета палитры Excel)
@@ -80,9 +86,11 @@ ROW_HEIGHT = 15  # высота обычной строки в Excel, pt
 # Средняя ежемесячная скидка от розничной цены (память проекта, 2026-10-04)
 DISCOUNT = {"ЮИ": 0.10, "ЗИ": 0.10, "СГ": 0.0}
 
-# колонки плана в csv (порядок и названия не меняем)
+# колонки плана в csv в порядке листа "План факт по категориям" ("план месяц" на листе не выводится)
 PLAN_COLUMNS = ["месяц", "магазин", "бит литера", "категория", "доля бит литеры",
-                "доля категории внутри бит литеры", "план месяц", "план"]
+                "доля категории внутри бит литеры", "план"]
+# переименование колонок на листе "План факт по категориям" (расчеты идут по исходным названиям)
+REPORT_RENAME = {"план": "план категории", "плана осталось": "плана осталось выполнить"}
 
 # остаток / шт продать осталось: от этого значения запас считается достаточным
 STOCK_COVER_OK = 3
@@ -168,13 +176,161 @@ def format_sheet(ws, columns: list) -> None:
                 )
 
 
-def build_report_xlsx(df: pd.DataFrame, sheet_name: str) -> bytes:
-    """xlsx в памяти: один лист с отформатированной таблицей (общий для витрины и бота)."""
+REPORT_SHEET = "План факт по категориям"
+PLAN_FACT_SHEET = "План факт по филиалам"
+PLAN_FACT_LABEL = "показатель"
+# строки листа план-факт: суммы - финансовый формат, доли - проценты без знаков после запятой
+PLAN_FACT_AMOUNTS = ["план год", "план месяц", "факт YTD", "факт MTD", "факт YTD LY", "факт MTD LY"]
+PLAN_FACT_RATIOS = ["выполнение плана год", "выполнение плана месяц", "откл факт YTD YoY", "откл факт MTD YoY"]
+PLAN_FACT_ROWS = ["план год", "план месяц", "факт YTD", "факт MTD", "выполнение плана год", "выполнение плана месяц",
+                  "факт YTD LY", "факт MTD LY", "откл факт YTD YoY", "откл факт MTD YoY"]
+GLOSSARY_SHEET = "Обозначения"
+GLOSSARY = pd.DataFrame(
+    [
+        ("YTD", "период с начала текущего года по дату отчета"),
+        ("MTD", "период с первого числа текущего месяца по дату отчета"),
+        ("LY", "показатель за такой же период в прошлом году"),
+        ("YoY", "сравнение показателей за текущий год к прошлому году за одинаковый период"),
+    ],
+    columns=["обозначение", "описание"],
+)
+# условное форматирование листа план-факт (цвета стандартных правил Excel)
+PLAN_FACT_BAR_ROWS = ["выполнение плана год", "выполнение плана месяц"]  # голубая гистограмма, сплошная заливка
+PLAN_FACT_BAR_COLOR = "FF008AEF"  # "Голубая гистограмма"
+PLAN_FACT_SIGN_ROWS = ["откл факт YTD YoY", "откл факт MTD YoY"]  # <= 0 - красный, > 0 - зеленый
+SIGN_NEGATIVE = (PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"), Font(color="9C0006", bold=True))
+SIGN_POSITIVE = (PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"), Font(color="006100"))
+
+
+def sum_by_filial(df: pd.DataFrame, column: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
+    period = df[(df["date"] >= start) & (df["date"] <= end)]
+    return period.groupby("магазин")[column].sum()
+
+
+def calc_plan_fact(sales: pd.DataFrame, daily_plan: pd.DataFrame, filials: list, as_of: pd.Timestamp) -> pd.DataFrame:
+    """План / факт по филиалам: строки - показатели, столбцы - филиалы.
+
+    План год / месяц - сумма дневного плана за весь год / месяц as_of.
+    Факт YTD - с 1 января по as_of, MTD - с 1-го числа месяца по as_of; LY - те же даты прошлого года.
+    Факт - все продажи филиала (сумма_со_скидкой).
+    выполнение плана год / месяц = факт YTD / план год, факт MTD / план месяц; откл факт YTD / MTD YoY = факт / факт LY - 1 (доли).
+    """
+    year_start, month_start = as_of.replace(month=1, day=1), as_of.replace(day=1)
+    ly = pd.DateOffset(years=1)
+    rows = {
+        "план год": sum_by_filial(daily_plan, "план", year_start, year_start + pd.offsets.YearEnd(0)),
+        "план месяц": sum_by_filial(daily_plan, "план", month_start, month_start + pd.offsets.MonthEnd(0)),
+        "факт YTD": sum_by_filial(sales, "сумма_со_скидкой", year_start, as_of),
+        "факт MTD": sum_by_filial(sales, "сумма_со_скидкой", month_start, as_of),
+        "факт YTD LY": sum_by_filial(sales, "сумма_со_скидкой", year_start - ly, as_of - ly),
+        "факт MTD LY": sum_by_filial(sales, "сумма_со_скидкой", month_start - ly, as_of - ly),
+    }
+    t = pd.DataFrame(rows).reindex(filials)
+    for name in ["факт YTD", "факт MTD", "факт YTD LY", "факт MTD LY"]:
+        t[name] = t[name].fillna(0)
+    ratio = lambda a, b: t[a] / t[b].where(t[b] > 0)  # нет плана / нет продаж LY - пусто
+    t["выполнение плана год"] = ratio("факт YTD", "план год")
+    t["выполнение плана месяц"] = ratio("факт MTD", "план месяц")
+    t["откл факт YTD YoY"] = ratio("факт YTD", "факт YTD LY") - 1
+    t["откл факт MTD YoY"] = ratio("факт MTD", "факт MTD LY") - 1
+    return t[PLAN_FACT_ROWS].T.rename_axis(PLAN_FACT_LABEL).reset_index()
+
+
+def format_plan_fact_sheet(ws, columns: list) -> None:
+    """Лист план-факт: таблица Excel, форматы по строкам (суммы / доли), ширина столбцов по значениям,
+    условное форматирование строк выполнения плана (гистограмма) и откл факт YTD / MTD YoY (знак)."""
+    last_col, last_row = get_column_letter(ws.max_column), ws.max_row
+    table = Table(displayName="plan_fact", ref=f"A1:{last_col}{last_row}")
+    table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
+    ws.add_table(table)
+    ws.row_dimensions[1].height = ROW_HEIGHT * HEADER_LINES
+    widths = [0] * len(columns)
+    for row in ws.iter_rows(min_row=2):
+        label = row[0].value
+        number_format, display = (FINANCIAL, ("financial", 0)) if label in PLAN_FACT_AMOUNTS else ("0%", ("percent", 0))
+        for idx, cell in enumerate(row):
+            if idx:
+                cell.number_format = number_format
+            widths[idx] = max(widths[idx], display_length(cell.value, display if idx else None))
+    for idx, name in enumerate(columns):
+        letter = get_column_letter(idx + 1)
+        ws[f"{letter}1"].alignment = Alignment(wrap_text=True, vertical="center")
+        ws.column_dimensions[letter].width = header_width(name, max(widths[idx], 6) + 3)
+
+    if ws.max_column < 2:
+        return
+    for (cell,) in ws.iter_rows(min_row=2, max_col=1):
+        cells = f"B{cell.row}:{last_col}{cell.row}"
+        if cell.value in PLAN_FACT_BAR_ROWS:
+            # шкала 0..100% плана (а не min..max по строке): в файле филиала одна ячейка, полоса была бы всегда полной
+            ws.conditional_formatting.add(cells, DataBarRule(start_type="num", start_value=0, end_type="num",
+                                                             end_value=1, color=PLAN_FACT_BAR_COLOR))
+        elif cell.value in PLAN_FACT_SIGN_ROWS:
+            first = f"B{cell.row}"  # ISNUMBER: пустые ячейки (нет продаж LY) не красим
+            for formula, (fill, font) in [(f"AND(ISNUMBER({first}),{first}<=0)", SIGN_NEGATIVE),
+                                          (f"AND(ISNUMBER({first}),{first}>0)", SIGN_POSITIVE)]:
+                ws.conditional_formatting.add(cells, FormulaRule(formula=[formula], fill=fill, font=font))
+
+
+X14_NS = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"
+XM_NS = "http://schemas.microsoft.com/office/excel/2006/main"
+DATA_BAR_RE = re.compile(
+    r'(<conditionalFormatting sqref="([^"]+)"><cfRule type="dataBar" priority="\d+"><dataBar>(.*?)</dataBar>)(</cfRule>)'
+)
+
+
+def solid_data_bars(xlsx: bytes) -> bytes:
+    """Делает гистограммы сплошной заливкой.
+
+    openpyxl пишет только гистограмму Excel 2007 (всегда градиент); сплошная заливка задается расширением x14
+    (gradient="0"), которое дописываем в xml листов: ссылка x14:id в cfRule и описание правила в extLst листа.
+    """
+    src = zipfile.ZipFile(io.BytesIO(xlsx))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename.startswith("xl/worksheets/") and b'type="dataBar"' in data:
+                xml, x14_rules = data.decode("utf-8"), []
+
+                def add_ext(match):
+                    rule_id = f"{{{uuid.uuid4()}}}".upper()
+                    cfvo = "".join(f'<x14:cfvo type="{t}"><xm:f>{v}</xm:f></x14:cfvo>'
+                                   for t, v in re.findall(r'<cfvo type="(\w+)" val="([^"]*)"', match.group(3)))
+                    x14_rules.append(
+                        f'<x14:conditionalFormatting xmlns:xm="{XM_NS}"><x14:cfRule type="dataBar" id="{rule_id}">'
+                        f'<x14:dataBar minLength="0" maxLength="100" gradient="0">{cfvo}'
+                        f'<x14:negativeFillColor rgb="FFFF0000"/><x14:axisColor rgb="FF000000"/></x14:dataBar>'
+                        f'</x14:cfRule><xm:sqref>{match.group(2)}</xm:sqref></x14:conditionalFormatting>'
+                    )
+                    return (f'{match.group(1)}<extLst><ext uri="{{B025F937-C7B1-47D3-B67F-A62EFF666E3E}}" '
+                            f'xmlns:x14="{X14_NS}"><x14:id>{rule_id}</x14:id></ext></extLst>{match.group(4)}')
+
+                xml = DATA_BAR_RE.sub(add_ext, xml)
+                ext = (f'<extLst><ext uri="{{78C0D931-6437-407d-A8EE-F0AAD7539E65}}" xmlns:x14="{X14_NS}">'
+                       f'<x14:conditionalFormattings>{"".join(x14_rules)}</x14:conditionalFormattings></ext></extLst>')
+                data = xml.replace("</worksheet>", ext + "</worksheet>").encode("utf-8")
+            dst.writestr(item, data)
+    return out.getvalue()
+
+
+def build_report_xlsx(df: pd.DataFrame, plan_fact: pd.DataFrame = None) -> bytes:
+    """xlsx в памяти: лист план-факт по филиалам (если передан, первым), лист витрины по категориям
+    и (вместе с план-фактом) лист "Обозначения"."""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name=sheet_name, index=False)
-        format_sheet(writer.sheets[sheet_name], list(df.columns))
-    return buffer.getvalue()
+        if plan_fact is not None:
+            plan_fact.to_excel(writer, sheet_name=PLAN_FACT_SHEET, index=False)
+            format_plan_fact_sheet(writer.sheets[PLAN_FACT_SHEET], list(plan_fact.columns))
+        df.to_excel(writer, sheet_name=REPORT_SHEET, index=False)
+        format_sheet(writer.sheets[REPORT_SHEET], list(df.columns))
+        if plan_fact is not None:
+            GLOSSARY.to_excel(writer, sheet_name=GLOSSARY_SHEET, index=False)
+            ws = writer.sheets[GLOSSARY_SHEET]
+            for idx, name in enumerate(GLOSSARY.columns, start=1):
+                width = max(len(name), GLOSSARY[name].str.len().max()) + 3
+                ws.column_dimensions[get_column_letter(idx)].width = width
+    return solid_data_bars(buffer.getvalue())
 
 
 def filial_filename(filial: str) -> str:
@@ -257,14 +413,19 @@ def update_report(as_of_arg: str = None) -> None:
     )
     out.loc[need.isna() & ~no_stock, "возможность выполнить план"] = np.nan
 
-    # колонки плана остаются как в csv, справа добавляются расчетные
+    # колонки плана как в csv (без "план месяц"), справа расчетные; затем переименование для листа
     out = out.rename(columns={"бит_литера": "бит литера"})
     out = out[[*PLAN_COLUMNS, "факт_mtd", "выполнение плана", "плана осталось", "остаток_шт", "средняя цена продажи с учетом скидки", "шт продать осталось", "возможность выполнить план", "дата_факта", "дата_остатка"]]
+    out = out.rename(columns=REPORT_RENAME)
     as_of_name = f"{as_of:{DATE_FORMAT}}"
     folder_id = find_or_create_subfolder(service, REPORTS_FOLDER_ID, as_of_name)
-    upload_bytes(service, folder_id, REPORT_FILENAME, build_report_xlsx(out, as_of_name), XLSX_MIMETYPE)
+    # филиалы - столбцы в порядке витрины (только филиалы с планом по категориям)
+    daily_plan = read_drive_csv(service, DAILY_PLAN_ID, usecols=["date", "магазин", "план"], parse_dates=["date"])
+    plan_fact = calc_plan_fact(sales, daily_plan, list(out["магазин"].unique()), as_of)
+    upload_bytes(service, folder_id, REPORT_FILENAME, build_report_xlsx(out, plan_fact), XLSX_MIMETYPE)
     for filial, filial_rows in out.groupby("магазин", sort=True):
-        upload_bytes(service, folder_id, filial_filename(filial), build_report_xlsx(filial_rows, as_of_name), XLSX_MIMETYPE)
+        filial_plan_fact = plan_fact[[PLAN_FACT_LABEL, filial]]  # на листе по филиалам только столбец этого филиала
+        upload_bytes(service, folder_id, filial_filename(filial), build_report_xlsx(filial_rows, filial_plan_fact), XLSX_MIMETYPE)
 
     # дата в pipeline_state - только после загрузки всех файлов, чтобы бот не увидел неполную папку;
     # пересчет за прошлую дату (--as-of) не откатывает дату, которую видит бот
