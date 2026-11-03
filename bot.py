@@ -1,9 +1,10 @@
 """Telegram-бот товарного отчета (long polling).
 
 Команды:
-    /updated   - название листа report.xlsx на Google Drive (там записана максимальная дата_факта)
-    /report    - отправляет в чат report.xlsx: по файлу на каждый доступный филиал ({филиал}_{as_of}.xlsx),
-                 а при доступе all - общий отчет по всем филиалам
+    /updated   - дата обновления отчета из pipeline_state.csv (строка tovarnyi_otchet_tgbot)
+    /report    - берет дату из pipeline_state.csv, находит на Drive папку с этой датой (ДД.ММ.ГГГГ)
+                 и отправляет из нее по файлу на каждый доступный филиал ({филиал}_{as_of}.xlsx),
+                 а при доступе all - общий отчет report.xlsx по всем филиалам
     /my_store - список доступных филиалов
 
 Доступ берется из Google Таблицы Users (колонки user_id, access): user_id - числовой id в Telegram,
@@ -22,13 +23,11 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-import pandas as pd
 import requests
 from dotenv import load_dotenv
-from openpyxl import load_workbook
 
-from app import build_report_xlsx
-from drive_client import download_bytes, export_sheet_csv, get_drive_service
+from app import DATE_FORMAT, REPORT_FILENAME, REPORTS_FOLDER_ID, filial_filename, get_state_date
+from drive_client import download_bytes, export_sheet_csv, find_child, get_drive_service, list_children
 
 BASE_DIR = Path(__file__).parent
 
@@ -37,7 +36,6 @@ load_dotenv(BASE_DIR / ".env")
 CREDS_PATH = BASE_DIR / os.environ["DRIVE_CREDS_PATH"]
 TOKEN_PATH = BASE_DIR / os.environ["DRIVE_TOKEN_PATH"]
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-REPORT_XLSX_ID = os.environ["REPORT_XLSX_ID"]
 USERS_SHEET_ID = os.environ["USERS_SHEET_ID"]
 XLSX_MIMETYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -45,16 +43,14 @@ API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 POLL_TIMEOUT = 50  # сек, long polling
 
 ACCESS_ALL = "all"
-SHOP_COLUMN_IDX = 1  # "магазин" - второй столбец report.xlsx
 
 logger = logging.getLogger("bot")
 
 
-def get_updated_date() -> str:
-    """Дата обновления данных - название листа отчета на Drive (ДД.ММ.ГГГГ)."""
-    service = get_drive_service(CREDS_PATH, TOKEN_PATH)
-    workbook = load_workbook(download_bytes(service, REPORT_XLSX_ID), read_only=True)
-    return workbook.sheetnames[0]
+def get_updated_date(service=None) -> str | None:
+    """Дата обновления отчета из pipeline_state.csv (ДД.ММ.ГГГГ); None, если отчет еще не формировался."""
+    state_date = get_state_date(service or get_drive_service(CREDS_PATH, TOKEN_PATH))
+    return f"{state_date:{DATE_FORMAT}}" if state_date is not None else None
 
 
 def send_message(chat_id: int, text: str) -> None:
@@ -85,16 +81,9 @@ def get_access(user_id: int) -> list[str]:
     return filials
 
 
-def filter_report(report: pd.DataFrame, filial: str, as_of: str) -> bytes | None:
-    """xlsx (в памяти) только со строками филиала в том же формате, что и report.xlsx; None, если строк нет."""
-    filial_rows = report[report.iloc[:, SHOP_COLUMN_IDX] == filial]
-    if filial_rows.empty:
-        return None
-    return build_report_xlsx(filial_rows, as_of)
-
-
 def handle_updated(chat_id: int, user_id: int) -> None:
-    send_message(chat_id, f"Данные обновлены по {get_updated_date()}")
+    as_of = get_updated_date()
+    send_message(chat_id, f"Данные обновлены по {as_of}" if as_of else "Отчет еще не формировался")
 
 
 def handle_my_store(chat_id: int, user_id: int) -> None:
@@ -114,23 +103,27 @@ def handle_report(chat_id: int, user_id: int) -> None:
         return
 
     service = get_drive_service(CREDS_PATH, TOKEN_PATH)
-    report = download_bytes(service, REPORT_XLSX_ID).getvalue()
-    as_of = load_workbook(io.BytesIO(report), read_only=True).sheetnames[0]  # дата обновления - название листа
+    as_of = get_updated_date(service)
+    folder_id = find_child(service, REPORTS_FOLDER_ID, as_of, folder=True) if as_of else None
+    if folder_id is None:
+        send_message(chat_id, f"Отчет за {as_of} не найден" if as_of else "Отчет еще не формировался")
+        return
+    files = {child["name"]: child["id"] for child in list_children(service, folder_id)}
 
     if filials == [ACCESS_ALL]:
-        send_document(chat_id, f"Все филиалы_{as_of}.xlsx", report)
+        if REPORT_FILENAME not in files:
+            send_message(chat_id, f"Отчет за {as_of} не найден")
+            return
+        send_document(chat_id, f"Все филиалы_{as_of}.xlsx", download_bytes(service, files[REPORT_FILENAME]).getvalue())
         return
 
     no_data = []
-    report_df = pd.read_excel(io.BytesIO(report))  # читаем один раз, дальше только фильтр по филиалу
-    for col in report_df.select_dtypes("datetime"):
-        report_df[col] = report_df[col].dt.date  # как в app.py: даты без времени
     for filial in filials:
-        filial_report = filter_report(report_df, filial, as_of)
-        if filial_report is None:
+        file_id = files.get(filial_filename(filial))
+        if file_id is None:
             no_data.append(filial)
         else:
-            send_document(chat_id, f"{filial}_{as_of}.xlsx", filial_report)
+            send_document(chat_id, f"{filial}_{as_of}.xlsx", download_bytes(service, file_id).getvalue())
     if no_data:
         send_message(chat_id, f"Нет данных в отчете по филиалам: {', '.join(no_data)}")
 
@@ -178,6 +171,6 @@ if __name__ == "__main__":
     parser.add_argument("--updated", action="store_true", help="вывести дату обновления и выйти")
     args = parser.parse_args()
     if args.updated:
-        print(get_updated_date())
+        print(get_updated_date() or "Отчет еще не формировался")
     else:
         run()

@@ -35,7 +35,7 @@ def get_drive_service(creds_path, token_path):
 def find_or_create_subfolder(service, parent_id, name):
     """Возвращает id подпапки name внутри parent_id, создавая её при необходимости."""
     query = (
-        f"'{parent_id}' in parents and name = '{name}' "
+        f"'{parent_id}' in parents and name = '{_quote(name)}' "
         f"and mimeType = '{FOLDER_MIMETYPE}' and trashed = false"
     )
     response = (
@@ -85,13 +85,26 @@ def list_children(service, parent_id):
             return children
 
 
+def find_child(service, parent_id, name, folder=False):
+    """id элемента name в папке parent_id (folder=True - только папки) или None."""
+    for child in list_children(service, parent_id):
+        if child["name"] == name and (not folder or child["mimeType"] == FOLDER_MIMETYPE):
+            return child["id"]
+    return None
+
+
+def _quote(value):
+    """Экранирование строки для запроса q Drive API."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
 def upload_bytes(service, folder_id, filename, data, mimetype):
     """Идемпотентно загружает data в folder_id под именем filename.
 
     Если файл с таким именем уже есть в папке — обновляет его содержимое,
     иначе создаёт новый. Возвращает id файла на Drive.
     """
-    query = f"'{folder_id}' in parents and name = '{filename}' and trashed = false"
+    query = f"'{folder_id}' in parents and name = '{_quote(filename)}' and trashed = false"
     response = (
         service.files()
         .list(

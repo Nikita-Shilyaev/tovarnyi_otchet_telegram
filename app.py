@@ -1,6 +1,9 @@
 """Витрина отчета: план / факт / остаток / средняя цена по месяц - магазин - бит литера - категория.
 
-Читает план (csv), Sales_sku_target и Ostatki_target с Google Drive, перезаписывает report.xlsx на Google Drive.
+Читает план (csv), Sales_sku_target и Ostatki_target с Google Drive.
+Результат кладет на Drive в папку с датой обновления данных (ДД.ММ.ГГГГ - последняя дата продаж) внутри
+REPORTS_FOLDER_ID: report.xlsx (все филиалы) и по файлу на филиал ({магазин}.xlsx). После загрузки всех файлов
+записывает эту дату в pipeline_state.csv (source=tovarnyi_otchet_tgbot) - по ней бот находит папку.
 Месяцы: все месяцы плана с января 2026 по месяц последней даты продаж.
 - факт: сумма_со_скидкой за месяц (для текущего месяца - MTD по as_of);
 - остаток: срез на 1-е число месяца; если среза на 1-е нет (текущий месяц) - последний срез внутри месяца.
@@ -8,7 +11,7 @@
 Запуск:
     python app.py                  # MTD на последнюю дату в продажах
     python app.py --as-of 2026-10-03
-    python app.py --schedule       # висит в фоне и обновляет report.xlsx сразу и далее каждые 24 часа
+    python app.py --schedule       # висит в фоне и обновляет отчет сразу и далее каждые 24 часа
 """
 import argparse
 import io
@@ -27,7 +30,7 @@ from openpyxl.styles import Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-from drive_client import download_bytes, get_drive_service, update_file_bytes
+from drive_client import download_bytes, find_or_create_subfolder, get_drive_service, update_file_bytes, upload_bytes
 
 BASE_DIR = Path(__file__).parent
 logger = logging.getLogger("app")
@@ -40,8 +43,16 @@ SALES_SKU_ID = os.environ["SALES_SKU_TARGET_ID"]
 OSTATKI_ID = os.environ["OSTATKI_TARGET_ID"]
 
 PLAN_ID = os.environ["PLAN_PRODAZH_ID"]
-REPORT_XLSX_ID = os.environ["REPORT_XLSX_ID"]
+REPORTS_FOLDER_ID = os.environ["REPORTS_FOLDER_ID"]  # папка, в которой создаются папки с датами отчета
+PIPELINE_STATE_ID = os.environ["PIPELINE_STATE_ID"]
 XLSX_MIMETYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+CSV_MIMETYPE = "text/csv"
+
+REPORT_FILENAME = "report.xlsx"
+DATE_FORMAT = "%d.%m.%Y"  # имя папки отчета и название листа
+# строка отчета в pipeline_state.csv (source, layer, updated_at); updated_at в ISO, как у остальных строк
+STATE_SOURCE = "tovarnyi_otchet_tgbot"
+STATE_LAYER = "mart"
 
 # форматы Excel: колонка -> (формат, вид отображения для расчета ширины)
 CURRENCY = r"[$₸-43F]"  # тенге (kk-KZ)
@@ -166,6 +177,35 @@ def build_report_xlsx(df: pd.DataFrame, sheet_name: str) -> bytes:
     return buffer.getvalue()
 
 
+def filial_filename(filial: str) -> str:
+    """Имя файла филиала в папке отчета (общее для витрины и бота)."""
+    return "".join("_" if ch in '\\/:*?"<>|' else ch for ch in filial).strip() + ".xlsx"
+
+
+def read_pipeline_state(service) -> pd.DataFrame:
+    return read_drive_csv(service, PIPELINE_STATE_ID, dtype=str, keep_default_na=False)
+
+
+def get_state_date(service) -> pd.Timestamp | None:
+    """Дата обновления отчета из pipeline_state.csv; None, если строки отчета нет."""
+    state = read_pipeline_state(service)
+    row = state[state["source"] == STATE_SOURCE]
+    return pd.Timestamp(row["updated_at"].iloc[0]) if not row.empty else None
+
+
+def set_state_date(service, as_of: pd.Timestamp) -> None:
+    """Записывает дату отчета в pipeline_state.csv (обновляет строку отчета или добавляет ее в конец)."""
+    state = read_pipeline_state(service)
+    value = f"{as_of:%Y-%m-%d}"
+    mask = state["source"] == STATE_SOURCE
+    if mask.any():
+        state.loc[mask, "updated_at"] = value
+    else:
+        state.loc[len(state)] = {"source": STATE_SOURCE, "layer": STATE_LAYER, "updated_at": value}
+    data = state.to_csv(index=False, lineterminator="\r\n").encode("utf-8")
+    update_file_bytes(service, PIPELINE_STATE_ID, data, CSV_MIMETYPE)
+
+
 def update_report(as_of_arg: str = None) -> None:
     service = get_drive_service(CREDS_PATH, TOKEN_PATH)
     plan = read_drive_csv(service, PLAN_ID, dtype={"месяц": str}).rename(columns={"бит литера": "бит_литера"})
@@ -220,26 +260,38 @@ def update_report(as_of_arg: str = None) -> None:
     # колонки плана остаются как в csv, справа добавляются расчетные
     out = out.rename(columns={"бит_литера": "бит литера"})
     out = out[[*PLAN_COLUMNS, "факт_mtd", "выполнение плана", "плана осталось", "остаток_шт", "средняя цена продажи с учетом скидки", "шт продать осталось", "возможность выполнить план", "дата_факта", "дата_остатка"]]
-    sheet_name = f"{out['дата_факта'].max():%d.%m.%Y}"  # бот (/updated) берет дату обновления из названия листа
-    update_file_bytes(service, REPORT_XLSX_ID, build_report_xlsx(out, sheet_name), XLSX_MIMETYPE)
+    as_of_name = f"{as_of:{DATE_FORMAT}}"
+    folder_id = find_or_create_subfolder(service, REPORTS_FOLDER_ID, as_of_name)
+    upload_bytes(service, folder_id, REPORT_FILENAME, build_report_xlsx(out, as_of_name), XLSX_MIMETYPE)
+    for filial, filial_rows in out.groupby("магазин", sort=True):
+        upload_bytes(service, folder_id, filial_filename(filial), build_report_xlsx(filial_rows, as_of_name), XLSX_MIMETYPE)
+
+    # дата в pipeline_state - только после загрузки всех файлов, чтобы бот не увидел неполную папку;
+    # пересчет за прошлую дату (--as-of) не откатывает дату, которую видит бот
+    state_date = get_state_date(service)
+    if state_date is None or as_of >= state_date:
+        set_state_date(service, as_of)
+    else:
+        print(f"pipeline_state не изменен: там более поздняя дата {state_date:{DATE_FORMAT}}")
 
     in_period = sales[(sales["date"] >= pd.Timestamp("2026-01-01")) & (sales["date"] <= as_of)]
-    print(f"report.xlsx (Drive): {len(out)} строк, месяцев {out['месяц'].nunique()}, факт по {as_of.date()}")
+    print(f"Папка {as_of_name} (Drive): report.xlsx {len(out)} строк, филиалов {out['магазин'].nunique()}, "
+          f"месяцев {out['месяц'].nunique()}, факт по {as_of.date()}")
     print(f"Продажи вне плана (не вошли в витрину): {in_period['сумма_со_скидкой'].sum() - out['факт_mtd'].sum():,.0f}")
 
 
 def run_scheduler() -> None:
-    """Обновляет report.xlsx каждые 24 часа. Ошибка в одном запуске не останавливает расписание."""
+    """Обновляет отчет каждые 24 часа. Ошибка в одном запуске не останавливает расписание."""
     scheduler = BlockingScheduler()
     scheduler.add_job(update_report, "interval", hours=24, next_run_time=datetime.now())  # первый запуск сразу
-    logger.info("Планировщик запущен: обновление report.xlsx сразу и далее каждые 24 часа")
+    logger.info("Планировщик запущен: обновление отчета сразу и далее каждые 24 часа")
     scheduler.start()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--as-of", help="дата, по которую считать MTD (по умолчанию - последняя дата продаж)")
-    parser.add_argument("--schedule", action="store_true", help="обновлять report.xlsx каждые 24 часа")
+    parser.add_argument("--schedule", action="store_true", help="обновлять отчет каждые 24 часа")
     args = parser.parse_args()
     if args.schedule:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
