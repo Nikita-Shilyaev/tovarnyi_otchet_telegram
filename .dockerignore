@@ -16,3 +16,4 @@ __pycache__/
 *.xlsm
 *.csv
 *.ipynb
+*.docx
