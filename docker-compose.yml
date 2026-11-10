@@ -1,6 +1,6 @@
 x-common: &common
   build: .
-  image: tovarnyi_otchet_bot:v3.0
+  image: tovarnyi_otchet_bot:v3.1
   env_file: .env
   volumes:
     - ./creds:/app/creds  # token.json обновляется на ходу, поэтому не read-only

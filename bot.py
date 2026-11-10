@@ -3,7 +3,8 @@
 Команды:
     /updated   - дата обновления отчета из pipeline_state.csv (строка tovarnyi_otchet_tgbot)
     /report    - берет дату из pipeline_state.csv, находит на Drive папку с этой датой (ДД.ММ.ГГГГ)
-                 и отправляет из нее по файлу на каждый доступный филиал ({филиал}_{as_of}.xlsx),
+                 и отправляет из нее один файл со всеми доступными филиалами
+                 ({филиал1}_{филиал2}_..._{as_of}.xlsx - готовит app.py по таблице Users),
                  а при доступе all - общий отчет report.xlsx по всем филиалам
     /my_store - список доступных филиалов
 
@@ -15,19 +16,17 @@ access - название филиала (значение в поле "мага
     python bot.py --updated  # вывести дату обновления и выйти (без Telegram)
 """
 import argparse
-import csv
-import io
 import logging
 import os
 import time
-from collections import defaultdict
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 
-from app import DATE_FORMAT, REPORT_FILENAME, REPORTS_FOLDER_ID, filial_filename, get_state_date
-from drive_client import download_bytes, export_sheet_csv, find_child, get_drive_service, list_children
+from app import (ACCESS_ALL, DATE_FORMAT, REPORT_FILENAME, REPORTS_FOLDER_ID, combo_filename, combo_name,
+                 get_state_date, read_access)
+from drive_client import download_bytes, find_child, get_drive_service, list_children
 
 BASE_DIR = Path(__file__).parent
 
@@ -36,13 +35,10 @@ load_dotenv(BASE_DIR / ".env")
 CREDS_PATH = BASE_DIR / os.environ["DRIVE_CREDS_PATH"]
 TOKEN_PATH = BASE_DIR / os.environ["DRIVE_TOKEN_PATH"]
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-USERS_SHEET_ID = os.environ["USERS_SHEET_ID"]
 XLSX_MIMETYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 POLL_TIMEOUT = 50  # сек, long polling
-
-ACCESS_ALL = "all"
 
 logger = logging.getLogger("bot")
 
@@ -69,16 +65,8 @@ def send_document(chat_id: int, filename: str, data: bytes) -> None:
 
 
 def get_access(user_id: int) -> list[str]:
-    """Филиалы пользователя из таблицы Users (в порядке строк); ['all'] - все филиалы; [] - нет доступа."""
-    service = get_drive_service(CREDS_PATH, TOKEN_PATH)
-    rows = csv.DictReader(io.StringIO(export_sheet_csv(service, USERS_SHEET_ID)))
-    access = defaultdict(list)
-    for row in rows:
-        access[row["user_id"].strip()].append(row["access"].strip())
-    filials = access.get(str(user_id), [])
-    if any(f.lower() == ACCESS_ALL for f in filials):
-        return [ACCESS_ALL]
-    return filials
+    """Филиалы пользователя из таблицы Users (по алфавиту); ['all'] - все филиалы; [] - нет доступа."""
+    return read_access(get_drive_service(CREDS_PATH, TOKEN_PATH)).get(str(user_id), [])
 
 
 def handle_updated(chat_id: int, user_id: int) -> None:
@@ -117,15 +105,14 @@ def handle_report(chat_id: int, user_id: int) -> None:
         send_document(chat_id, f"Все филиалы_{as_of}.xlsx", download_bytes(service, files[REPORT_FILENAME]).getvalue())
         return
 
-    no_data = []
-    for filial in filials:
-        file_id = files.get(filial_filename(filial))
-        if file_id is None:
-            no_data.append(filial)
-        else:
-            send_document(chat_id, f"{filial}_{as_of}.xlsx", download_bytes(service, file_id).getvalue())
-    if no_data:
-        send_message(chat_id, f"Нет данных в отчете по филиалам: {', '.join(no_data)}")
+    # один файл на комбинацию филиалов пользователя (готовит app.py по таблице Users)
+    file_id = files.get(combo_filename(filials))
+    if file_id is None:
+        # нет строк в отчете по этим филиалам или доступ добавлен после последнего обновления отчета
+        send_message(chat_id, f"Отчет за {as_of} по филиалам {', '.join(filials)} не найден: нет данных "
+                              "или доступ добавлен после обновления - файл появится при следующем обновлении")
+        return
+    send_document(chat_id, f"{combo_name(filials)}_{as_of}.xlsx", download_bytes(service, file_id).getvalue())
 
 
 HANDLERS = {"/updated": handle_updated, "/report": handle_report, "/my_store": handle_my_store}

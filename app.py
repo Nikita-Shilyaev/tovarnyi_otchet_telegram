@@ -2,12 +2,14 @@
 
 Читает план (csv), дневной план, Sales_sku_target и Ostatki_target с Google Drive.
 Результат кладет на Drive в папку с датой обновления данных (ДД.ММ.ГГГГ - последняя дата продаж) внутри
-REPORTS_FOLDER_ID: report.xlsx (все филиалы) и по файлу на филиал ({магазин}.xlsx). После загрузки всех файлов
+REPORTS_FOLDER_ID: report.xlsx (все филиалы) и по файлу на каждую комбинацию филиалов пользователей из таблицы
+Users ({филиал1}_{филиал2}_....xlsx, филиалы по алфавиту). После загрузки всех файлов
 записывает эту дату в pipeline_state.csv (source=tovarnyi_otchet_tgbot) - по ней бот находит папку.
 Листы report.xlsx: "План факт по филиалам" (первый): план на год и месяц
 (дневной план), факт YTD/MTD (все продажи филиала), выполнение плана и факт прошлого года за те же даты;
-"План факт по категориям" - витрина; "Артикулы" - остаток и базовая скорость продаж по магазину, артикулу,
-цвету и размеру (все артикулы и магазины, одинаковый во всех файлах); "Обозначения" - расшифровка YTD/MTD/LY/YoY. В файлах филиалов те же листы, на листе по филиалам - только свой столбец.
+"План факт по категориям" - витрина; "Артикулы" - остаток и скорость продаж с учетом наличия по магазину, артикулу,
+цвету и размеру (все артикулы и магазины, одинаковый во всех файлах); "Обозначения" - расшифровка YTD/MTD/LY/YoY. В файлах комбинаций те же листы,
+на листах по филиалам и по категориям - только филиалы комбинации.
 Месяцы: все месяцы плана с января 2026 по месяц последней даты продаж.
 - факт: сумма_со_скидкой за месяц (для текущего месяца - MTD по as_of);
 - остаток: срез на 1-е число месяца; если среза на 1-е нет (текущий месяц) - последний срез внутри месяца.
@@ -18,6 +20,7 @@ REPORTS_FOLDER_ID: report.xlsx (все филиалы) и по файлу на �
     python app.py --schedule       # висит в фоне и обновляет отчет сразу и далее каждые 24 часа
 """
 import argparse
+import csv
 import io
 import logging
 import os
@@ -25,6 +28,7 @@ import re
 import textwrap
 import uuid
 import zipfile
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -37,7 +41,8 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-from drive_client import download_bytes, find_or_create_subfolder, get_drive_service, update_file_bytes, upload_bytes
+from drive_client import (download_bytes, export_sheet_csv, find_or_create_subfolder, get_drive_service,
+                          update_file_bytes, upload_bytes)
 
 BASE_DIR = Path(__file__).parent
 logger = logging.getLogger("app")
@@ -53,6 +58,8 @@ PLAN_ID = os.environ["PLAN_PRODAZH_ID"]
 DAILY_PLAN_ID = os.environ["DAILY_PLAN_ID"]  # daily_plan_updated_06082026.csv: date, магазин, план, месячный_план
 REPORTS_FOLDER_ID = os.environ["REPORTS_FOLDER_ID"]  # папка, в которой создаются папки с датами отчета
 PIPELINE_STATE_ID = os.environ["PIPELINE_STATE_ID"]
+USERS_SHEET_ID = os.environ["USERS_SHEET_ID"]  # Google Таблица доступов: user_id, access (филиал или all)
+ACCESS_ALL = "all"
 XLSX_MIMETYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 CSV_MIMETYPE = "text/csv"
 
@@ -73,7 +80,6 @@ COLUMN_FORMATS = {
     "факт_mtd": (FINANCIAL, ("financial", 0)),
     "плана осталось выполнить": (FINANCIAL, ("financial", 0)),
     "средняя цена продажи с учетом скидки": (FINANCIAL, ("financial", 0)),
-    "скорость продаж базовая": ("0.00", ("fixed", 2)),
     "скорость продаж с учетом наличия": ("0.00", ("fixed", 2)),
 }
 # заливка флага "возможность выполнить план" (стандартные цвета палитры Excel)
@@ -199,9 +205,7 @@ GLOSSARY = pd.DataFrame(
         ("MTD", "период с первого числа текущего месяца по дату отчета"),
         ("LY", "показатель за такой же период в прошлом году"),
         ("YoY", "сравнение показателей за текущий год к прошлому году за одинаковый период"),
-        ("скорость продаж базовая", "среднее кол-во продаж артикула в шт в месяц за последние 12 месяцев до даты отчета "
-                                    "(продажи шт за 12 мес / 12), без учета дней отсутствия товара на остатках"),
-        ("месяцев с остатком", "за те же 12 месяцев: в скольких месяцах артикул был в наличии в магазине "
+        ("месяцев с остатком", "за последние 12 месяцев до даты отчета: в скольких месяцах артикул был в наличии в магазине "
                                "(остаток больше 0 на конец месяца)"),
         ("скорость продаж с учетом наличия", "среднее кол-во продаж артикула в шт за месяц, когда он был в наличии: "
                                              "продажи шт за 12 мес / месяцев с остатком; пусто, если месяцев с остатком 0"),
@@ -338,9 +342,8 @@ ITEM_ATTRS = ["коллекция", "вставка"]
 VARIANT = ["цвет", "размер"]
 NO_SIZE = -1.0  # пустой размер в ключе группировки (NaN в ключах groupby теряется)
 ARTICLES_COLUMNS = ["магазин", "артикул", "поставщик", "бит литера", "категория", "подкатегория", "коллекция", "вставка",
-                    "цвет", "размер", "продажи шт за 12 мес", "месяцев с остатком", "скорость продаж базовая",
+                    "цвет", "размер", "продажи шт за 12 мес", "месяцев с остатком",
                     "скорость продаж с учетом наличия", "текущий остаток"]
-SPEED_MONTHS = 12
 # цвет в остатках пишется по-разному ("Белое", "БЕЛЫЙ", "<>", "жолтое") - приводим к словарю продаж
 COLOR_STEMS = [("бел", "Белый"), ("жел", "Желтый"), ("жол", "Желтый"), ("крас", "Красный"), ("роз", "Розовый"),
                ("комб", "Комбинированный"), ("серебр", "Серебро"), ("золот", "Золото")]
@@ -380,10 +383,10 @@ def barcode_attrs(sales: pd.DataFrame, ostatki: pd.DataFrame) -> pd.DataFrame:
 
 def calc_articles(sales: pd.DataFrame, ostatki: pd.DataFrame, snapshot: pd.Timestamp, as_of: pd.Timestamp) -> pd.DataFrame:
     """Лист "Артикулы": строка - магазин, изделие (артикул, бит литера, поставщик, категория, подкатегория),
-    цвет и размер; базовая скорость продаж и текущий остаток.
+    цвет и размер; скорость продаж с учетом наличия и текущий остаток.
 
-    скорость продаж базовая = продажи шт (количество, нетто с возвратами) за 12 месяцев до даты отчета
-    (as_of - 1 год ... as_of - 1 день) / 12; дни без остатка намеренно не учитываются (первая версия).
+    продажи шт за 12 мес - количество (нетто с возвратами) за 12 месяцев до даты отчета
+    (as_of - 1 год ... as_of - 1 день).
     месяцев с остатком - за тот же период число месяцев с остатком > 0 на конец месяца (срезы остатков на конец
     месяца хранятся под 1-м числом этого месяца: 2026-07-01 = остаток на 31.07.2026; берутся только полностью
     прошедшие месяцы периода, недельные срезы текущего месяца не считаются).
@@ -413,7 +416,6 @@ def calc_articles(sales: pd.DataFrame, ostatki: pd.DataFrame, snapshot: pd.Times
     stock_months = month_rows.groupby(group)["month"].nunique().rename("месяцев с остатком")
     t = t.join(stock_months).fillna({"месяцев с остатком": 0})
     t = t[(t["текущий остаток"] > 0) | (t["продажи шт за 12 мес"] != 0)].reset_index()
-    t["скорость продаж базовая"] = t["продажи шт за 12 мес"] / SPEED_MONTHS
     mode = lambda col: col.mode().iat[0] if col.notna().any() else None
     item_attrs = pd.concat([stock_rows, sold_rows]).groupby(ITEM_KEY)[ITEM_ATTRS].agg(mode)
     t = t.merge(item_attrs, left_on=ITEM_KEY, right_index=True, how="left")
@@ -460,9 +462,36 @@ def build_report_xlsx(df: pd.DataFrame, plan_fact: pd.DataFrame = None, articles
     return solid_data_bars(buffer.getvalue())
 
 
-def filial_filename(filial: str) -> str:
-    """Имя файла филиала в папке отчета (общее для витрины и бота)."""
-    return "".join("_" if ch in '\\/:*?"<>|' else ch for ch in filial).strip() + ".xlsx"
+def read_access(service) -> dict[str, list[str]]:
+    """Доступы из таблицы Users: user_id -> филиалы по алфавиту (без повторов) или ['all'].
+
+    Порядок строк в таблице не важен: одинаковый набор филиалов у разных пользователей дает одну комбинацию.
+
+    Строки с пустым user_id (пользователь еще не зарегистрирован в боте) собираются под ключом "",
+    чтобы файл его комбинации филиалов был готов к моменту регистрации.
+    """
+    access = defaultdict(set)
+    for row in csv.DictReader(io.StringIO(export_sheet_csv(service, USERS_SHEET_ID))):
+        user_id, filial = (row.get("user_id") or "").strip(), (row.get("access") or "").strip()
+        if filial:
+            access[user_id].add(filial)
+    return {user_id: [ACCESS_ALL] if any(f.lower() == ACCESS_ALL for f in filials) else sorted(filials)
+            for user_id, filials in access.items()}
+
+
+def access_combos(access: dict[str, list[str]]) -> list[tuple]:
+    """Уникальные комбинации филиалов пользователей (без доступа all), без повторов."""
+    return list(dict.fromkeys(tuple(filials) for filials in access.values() if filials != [ACCESS_ALL]))
+
+
+def combo_name(filials) -> str:
+    """Имя отчета комбинации филиалов: филиалы через "_" по алфавиту (общее для витрины и бота)."""
+    return "_".join("".join("_" if ch in '\\/:*?"<>|' else ch for ch in filial).strip() for filial in filials)
+
+
+def combo_filename(filials) -> str:
+    """Имя файла комбинации филиалов в папке отчета."""
+    return combo_name(filials) + ".xlsx"
 
 
 def read_pipeline_state(service) -> pd.DataFrame:
@@ -560,9 +589,20 @@ def update_report(as_of_arg: str = None) -> None:
     plan_fact = calc_plan_fact(sales, daily_plan, list(out["магазин"].unique()), as_of)
     articles = calc_articles(sales, ostatki, pick_snapshot(snapshots, as_of.replace(day=1)), as_of)
     upload_bytes(service, folder_id, REPORT_FILENAME, build_report_xlsx(out, plan_fact, articles), XLSX_MIMETYPE)
-    for filial, filial_rows in out.groupby("магазин", sort=True):
-        filial_plan_fact = plan_fact[[PLAN_FACT_LABEL, filial]]  # на листе по филиалам только столбец этого филиала
-        upload_bytes(service, folder_id, filial_filename(filial), build_report_xlsx(filial_rows, filial_plan_fact, articles, FILIAL_HIDDEN_COLUMNS), XLSX_MIMETYPE)
+    # по файлу на каждую комбинацию филиалов из таблицы Users: в файле только филиалы комбинации
+    # (лист "Артикулы" общий); филиалы без строк в витрине (нет плана) пропускаются
+    present = set(out["магазин"])
+    combos_done = 0
+    for combo in access_combos(read_access(service)):
+        filials = [filial for filial in combo if filial in present]
+        if not filials:
+            print(f"Нет данных в отчете по филиалам: {', '.join(combo)} - файл не сформирован")
+            continue
+        combo_rows = out[out["магазин"].isin(filials)]
+        combo_plan_fact = plan_fact[[PLAN_FACT_LABEL, *filials]]  # столбцы по алфавиту
+        upload_bytes(service, folder_id, combo_filename(combo),
+                     build_report_xlsx(combo_rows, combo_plan_fact, articles, FILIAL_HIDDEN_COLUMNS), XLSX_MIMETYPE)
+        combos_done += 1
 
     # дата в pipeline_state - только после загрузки всех файлов, чтобы бот не увидел неполную папку;
     # пересчет за прошлую дату (--as-of) не откатывает дату, которую видит бот
@@ -574,7 +614,7 @@ def update_report(as_of_arg: str = None) -> None:
 
     in_period = sales[(sales["date"] >= pd.Timestamp("2026-01-01")) & (sales["date"] <= as_of)]
     print(f"Папка {as_of_name} (Drive): report.xlsx {len(out)} строк, филиалов {out['магазин'].nunique()}, "
-          f"месяцев {out['месяц'].nunique()}, факт по {as_of.date()}")
+          f"месяцев {out['месяц'].nunique()}, факт по {as_of.date()}; файлов по комбинациям филиалов {combos_done}")
     print(f"Продажи вне плана (не вошли в витрину): {in_period['сумма_со_скидкой'].sum() - out['факт_mtd'].sum():,.0f}")
 
 
